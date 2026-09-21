@@ -1,0 +1,120 @@
+# Telescript Companion Interface - Windows input helper
+#
+# Sends a single keystroke or mouse click using low-level Win32 calls, so it
+# works no matter which window has focus (as long as this process and
+# Telescript run in the same user session / elevation level).
+#
+# Usage:
+#   powershell -NoProfile -ExecutionPolicy Bypass -File win-input.ps1 -Mode key -Modifiers ctrl,shift -Key c
+#   powershell -NoProfile -ExecutionPolicy Bypass -File win-input.ps1 -Mode click -Button right -X 400 -Y 300
+
+param(
+	[Parameter(Mandatory = $true)][string]$Mode,
+	[string]$Modifiers = '',
+	[string]$Key = '',
+	[string]$Button = 'left',
+	[int]$X = 0,
+	[int]$Y = 0
+)
+
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public class TCIInput {
+    [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
+    [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
+}
+'@
+
+$KEYEVENTF_KEYUP = 0x0002
+$MOUSEEVENTF_LEFTDOWN = 0x0002
+$MOUSEEVENTF_LEFTUP = 0x0004
+$MOUSEEVENTF_RIGHTDOWN = 0x0008
+$MOUSEEVENTF_RIGHTUP = 0x0010
+
+$VkMap = @{
+	'a' = 0x41; 'b' = 0x42; 'c' = 0x43; 'd' = 0x44; 'e' = 0x45; 'f' = 0x46; 'g' = 0x47; 'h' = 0x48
+	'i' = 0x49; 'j' = 0x4A; 'k' = 0x4B; 'l' = 0x4C; 'm' = 0x4D; 'n' = 0x4E; 'o' = 0x4F; 'p' = 0x50
+	'q' = 0x51; 'r' = 0x52; 's' = 0x53; 't' = 0x54; 'u' = 0x55; 'v' = 0x56; 'w' = 0x57; 'x' = 0x58
+	'y' = 0x59; 'z' = 0x5A
+	'0' = 0x30; '1' = 0x31; '2' = 0x32; '3' = 0x33; '4' = 0x34; '5' = 0x35; '6' = 0x36; '7' = 0x37
+	'8' = 0x38; '9' = 0x39
+	'f1' = 0x70; 'f2' = 0x71; 'f3' = 0x72; 'f4' = 0x73; 'f5' = 0x74; 'f6' = 0x75; 'f7' = 0x76
+	'f8' = 0x77; 'f9' = 0x78; 'f10' = 0x79; 'f11' = 0x7A; 'f12' = 0x7B; 'f13' = 0x7C; 'f14' = 0x7D
+	'f15' = 0x7E; 'f16' = 0x7F; 'f17' = 0x80; 'f18' = 0x81; 'f19' = 0x82; 'f20' = 0x83
+	'enter' = 0x0D; 'return' = 0x0D; 'tab' = 0x09; 'space' = 0x20; 'backspace' = 0x08
+	'delete' = 0x2E; 'escape' = 0x1B; 'esc' = 0x1B
+	'left' = 0x25; 'up' = 0x26; 'right' = 0x27; 'down' = 0x28
+	'home' = 0x24; 'end' = 0x23; 'pageup' = 0x21; 'pagedown' = 0x22; 'insert' = 0x2D
+}
+
+$ModMap = @{
+	'ctrl' = 0x11; 'control' = 0x11
+	'alt' = 0x12; 'option' = 0x12
+	'shift' = 0x10
+	'win' = 0x5B; 'windows' = 0x5B; 'cmd' = 0x5B; 'command' = 0x5B; 'meta' = 0x5B
+}
+
+function Send-Key {
+	param([string]$ModifiersStr, [string]$KeyName)
+
+	$mods = @()
+	if ($ModifiersStr -ne '') {
+		foreach ($m in $ModifiersStr.Split(',')) {
+			$m2 = $m.Trim().ToLower()
+			if ($m2 -ne '' -and $ModMap.ContainsKey($m2)) { $mods += $ModMap[$m2] }
+		}
+	}
+
+	$keyName2 = $KeyName.Trim().ToLower()
+	if (-not $VkMap.ContainsKey($keyName2)) {
+		Write-Error "Unknown key name: '$KeyName'"
+		exit 1
+	}
+	$vk = $VkMap[$keyName2]
+
+	foreach ($m in $mods) { [TCIInput]::keybd_event([byte]$m, 0, 0, [UIntPtr]::Zero) }
+	[TCIInput]::keybd_event([byte]$vk, 0, 0, [UIntPtr]::Zero)
+	Start-Sleep -Milliseconds 30
+	[TCIInput]::keybd_event([byte]$vk, 0, $KEYEVENTF_KEYUP, [UIntPtr]::Zero)
+	for ($i = $mods.Count - 1; $i -ge 0; $i--) {
+		[TCIInput]::keybd_event([byte]$mods[$i], 0, $KEYEVENTF_KEYUP, [UIntPtr]::Zero)
+	}
+}
+
+function Send-Click {
+	param([string]$ClickButton, [int]$Xpos, [int]$Ypos)
+
+	[TCIInput]::SetCursorPos($Xpos, $Ypos)
+	Start-Sleep -Milliseconds 30
+
+	switch ($ClickButton.ToLower()) {
+		'right' {
+			[TCIInput]::mouse_event($MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, [UIntPtr]::Zero)
+			Start-Sleep -Milliseconds 30
+			[TCIInput]::mouse_event($MOUSEEVENTF_RIGHTUP, 0, 0, 0, [UIntPtr]::Zero)
+		}
+		'double' {
+			[TCIInput]::mouse_event($MOUSEEVENTF_LEFTDOWN, 0, 0, 0, [UIntPtr]::Zero)
+			[TCIInput]::mouse_event($MOUSEEVENTF_LEFTUP, 0, 0, 0, [UIntPtr]::Zero)
+			Start-Sleep -Milliseconds 60
+			[TCIInput]::mouse_event($MOUSEEVENTF_LEFTDOWN, 0, 0, 0, [UIntPtr]::Zero)
+			[TCIInput]::mouse_event($MOUSEEVENTF_LEFTUP, 0, 0, 0, [UIntPtr]::Zero)
+		}
+		default {
+			[TCIInput]::mouse_event($MOUSEEVENTF_LEFTDOWN, 0, 0, 0, [UIntPtr]::Zero)
+			Start-Sleep -Milliseconds 30
+			[TCIInput]::mouse_event($MOUSEEVENTF_LEFTUP, 0, 0, 0, [UIntPtr]::Zero)
+		}
+	}
+}
+
+switch ($Mode.ToLower()) {
+	'key' { Send-Key -ModifiersStr $Modifiers -KeyName $Key }
+	'click' { Send-Click -ClickButton $Button -Xpos $X -Ypos $Y }
+	default {
+		Write-Error "Unknown mode: $Mode"
+		exit 1
+	}
+}
