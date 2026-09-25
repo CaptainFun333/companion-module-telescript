@@ -7,6 +7,9 @@
 # Usage:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File win-input.ps1 -Mode key -Modifiers ctrl,shift -Key c
 #   powershell -NoProfile -ExecutionPolicy Bypass -File win-input.ps1 -Mode click -Button right -X 400 -Y 300
+#   powershell -NoProfile -ExecutionPolicy Bypass -File win-input.ps1 -Mode moverelative -DX 0 -DY -15
+#   powershell -NoProfile -ExecutionPolicy Bypass -File win-input.ps1 -Mode wheel -Notches 1
+#   powershell -NoProfile -ExecutionPolicy Bypass -File win-input.ps1 -Mode middleclick
 
 param(
 	[Parameter(Mandatory = $true)][string]$Mode,
@@ -14,8 +17,13 @@ param(
 	[string]$Key = '',
 	[string]$Button = 'left',
 	[int]$X = 0,
-	[int]$Y = 0
+	[int]$Y = 0,
+	[int]$DX = 0,
+	[int]$DY = 0,
+	[int]$Notches = 0
 )
+
+Add-Type -AssemblyName System.Windows.Forms
 
 Add-Type @'
 using System;
@@ -110,9 +118,37 @@ function Send-Click {
 	}
 }
 
+$MOUSEEVENTF_MIDDLEDOWN = 0x0020
+$MOUSEEVENTF_MIDDLEUP = 0x0040
+$MOUSEEVENTF_WHEEL = 0x0800
+
+function Send-Wheel {
+	param([int]$WheelNotches)
+
+	$delta = $WheelNotches * 120
+	$data = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$delta), 0)
+	[TCIInput]::mouse_event($MOUSEEVENTF_WHEEL, 0, 0, $data, [UIntPtr]::Zero)
+}
+
+function Send-MiddleClickHere {
+	[TCIInput]::mouse_event($MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0, [UIntPtr]::Zero)
+	Start-Sleep -Milliseconds 30
+	[TCIInput]::mouse_event($MOUSEEVENTF_MIDDLEUP, 0, 0, 0, [UIntPtr]::Zero)
+}
+
+function Move-CursorRelative {
+	param([int]$DeltaX, [int]$DeltaY)
+
+	$current = [System.Windows.Forms.Cursor]::Position
+	[System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(($current.X + $DeltaX), ($current.Y + $DeltaY))
+}
+
 switch ($Mode.ToLower()) {
 	'key' { Send-Key -ModifiersStr $Modifiers -KeyName $Key }
 	'click' { Send-Click -ClickButton $Button -Xpos $X -Ypos $Y }
+	'moverelative' { Move-CursorRelative -DeltaX $DX -DeltaY $DY }
+	'wheel' { Send-Wheel -WheelNotches $Notches }
+	'middleclick' { Send-MiddleClickHere }
 	default {
 		Write-Error "Unknown mode: $Mode"
 		exit 1
