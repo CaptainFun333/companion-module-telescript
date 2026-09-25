@@ -10,6 +10,14 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File win-input.ps1 -Mode moverelative -DX 0 -DY -15
 #   powershell -NoProfile -ExecutionPolicy Bypass -File win-input.ps1 -Mode wheel -Notches 1
 #   powershell -NoProfile -ExecutionPolicy Bypass -File win-input.ps1 -Mode middleclick
+#   powershell -NoProfile -ExecutionPolicy Bypass -File win-input.ps1 -Mode serve
+#
+# -Mode serve is what the module uses: one long-running process that compiles the Win32 helper once and
+# then executes tab-separated commands read from stdin, one per line, in order:
+#   <id>	key	<mods,comma>	<key>   <id>	click	<button>	<x>	<y>   <id>	move	<dx>	<dy>
+#   <id>	wheel	<notches>          <id>	middle
+# and answering "<id>	ok" or "<id>	err	<message>" (after printing "ready" once at startup).
+# Starting a fresh PowerShell for every press cost about a second each.
 
 param(
 	[Parameter(Mandatory = $true)][string]$Mode,
@@ -64,8 +72,17 @@ $ModMap = @{
 	'win' = 0x5B; 'windows' = 0x5B; 'cmd' = 0x5B; 'command' = 0x5B; 'meta' = 0x5B
 }
 
+$HoldMs = 30
+
+function Wait-Ms {
+	param([double]$Ms)
+
+	$sw = [System.Diagnostics.Stopwatch]::StartNew()
+	while ($sw.Elapsed.TotalMilliseconds -lt $Ms) { }
+}
+
 function Send-Key {
-	param([string]$ModifiersStr, [string]$KeyName)
+	param([string]$ModifiersStr, [string]$KeyName, [int]$Repeat = 1)
 
 	$mods = @()
 	if ($ModifiersStr -ne '') {
@@ -77,15 +94,17 @@ function Send-Key {
 
 	$keyName2 = $KeyName.Trim().ToLower()
 	if (-not $VkMap.ContainsKey($keyName2)) {
-		Write-Error "Unknown key name: '$KeyName'"
-		exit 1
+		throw "Unknown key name: '$KeyName'"
 	}
 	$vk = $VkMap[$keyName2]
 
 	foreach ($m in $mods) { [TCIInput]::keybd_event([byte]$m, 0, 0, [UIntPtr]::Zero) }
-	[TCIInput]::keybd_event([byte]$vk, 0, 0, [UIntPtr]::Zero)
-	Start-Sleep -Milliseconds 30
-	[TCIInput]::keybd_event([byte]$vk, 0, $KEYEVENTF_KEYUP, [UIntPtr]::Zero)
+	for ($r = 0; $r -lt [Math]::Max(1, $Repeat); $r++) {
+		[TCIInput]::keybd_event([byte]$vk, 0, 0, [UIntPtr]::Zero)
+		if ($Repeat -gt 1) { Wait-Ms 2 } else { Start-Sleep -Milliseconds $HoldMs }
+		[TCIInput]::keybd_event([byte]$vk, 0, $KEYEVENTF_KEYUP, [UIntPtr]::Zero)
+		if ($r -lt $Repeat - 1) { Wait-Ms 2 }
+	}
 	for ($i = $mods.Count - 1; $i -ge 0; $i--) {
 		[TCIInput]::keybd_event([byte]$mods[$i], 0, $KEYEVENTF_KEYUP, [UIntPtr]::Zero)
 	}
@@ -95,12 +114,12 @@ function Send-Click {
 	param([string]$ClickButton, [int]$Xpos, [int]$Ypos)
 
 	[TCIInput]::SetCursorPos($Xpos, $Ypos)
-	Start-Sleep -Milliseconds 30
+	Start-Sleep -Milliseconds $HoldMs
 
 	switch ($ClickButton.ToLower()) {
 		'right' {
 			[TCIInput]::mouse_event($MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, [UIntPtr]::Zero)
-			Start-Sleep -Milliseconds 30
+			Start-Sleep -Milliseconds $HoldMs
 			[TCIInput]::mouse_event($MOUSEEVENTF_RIGHTUP, 0, 0, 0, [UIntPtr]::Zero)
 		}
 		'double' {
@@ -112,7 +131,7 @@ function Send-Click {
 		}
 		default {
 			[TCIInput]::mouse_event($MOUSEEVENTF_LEFTDOWN, 0, 0, 0, [UIntPtr]::Zero)
-			Start-Sleep -Milliseconds 30
+			Start-Sleep -Milliseconds $HoldMs
 			[TCIInput]::mouse_event($MOUSEEVENTF_LEFTUP, 0, 0, 0, [UIntPtr]::Zero)
 		}
 	}
@@ -125,14 +144,16 @@ $MOUSEEVENTF_WHEEL = 0x0800
 function Send-Wheel {
 	param([int]$WheelNotches)
 
-	$delta = $WheelNotches * 120
-	$data = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$delta), 0)
-	[TCIInput]::mouse_event($MOUSEEVENTF_WHEEL, 0, 0, $data, [UIntPtr]::Zero)
+	$step = if ($WheelNotches -lt 0) { -120 } else { 120 }
+	$data = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$step), 0)
+	for ($i = 0; $i -lt [Math]::Abs($WheelNotches); $i++) {
+		[TCIInput]::mouse_event($MOUSEEVENTF_WHEEL, 0, 0, $data, [UIntPtr]::Zero)
+	}
 }
 
 function Send-MiddleClickHere {
 	[TCIInput]::mouse_event($MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0, [UIntPtr]::Zero)
-	Start-Sleep -Milliseconds 30
+	Start-Sleep -Milliseconds $HoldMs
 	[TCIInput]::mouse_event($MOUSEEVENTF_MIDDLEUP, 0, 0, 0, [UIntPtr]::Zero)
 }
 
@@ -143,7 +164,36 @@ function Move-CursorRelative {
 	[System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(($current.X + $DeltaX), ($current.Y + $DeltaY))
 }
 
+function Start-InputServer {
+	$script:HoldMs = 10
+	[Console]::Out.WriteLine('ready')
+	[Console]::Out.Flush()
+	while ($true) {
+		$line = [Console]::In.ReadLine()
+		if ($null -eq $line) { break }
+		if ($line.Trim() -eq '') { continue }
+		$parts = $line.Split("`t")
+		$id = $parts[0]
+		try {
+			switch ($parts[1]) {
+				'key' { Send-Key -ModifiersStr $parts[2] -KeyName $parts[3] -Repeat $(if ($parts.Length -gt 4 -and $parts[4] -ne '') { [int]$parts[4] } else { 1 }) }
+				'click' { Send-Click -ClickButton $parts[2] -Xpos ([int]$parts[3]) -Ypos ([int]$parts[4]) }
+				'move' { Move-CursorRelative -DeltaX ([int]$parts[2]) -DeltaY ([int]$parts[3]) }
+				'wheel' { Send-Wheel -WheelNotches ([int]$parts[2]) }
+				'middle' { Send-MiddleClickHere }
+				default { throw "Unknown command '$($parts[1])'" }
+			}
+			$reply = "$id`tok"
+		} catch {
+			$reply = "$id`terr`t" + ($_.Exception.Message -replace '[\r\n\t]+', ' ')
+		}
+		[Console]::Out.WriteLine($reply)
+		[Console]::Out.Flush()
+	}
+}
+
 switch ($Mode.ToLower()) {
+	'serve' { Start-InputServer }
 	'key' { Send-Key -ModifiersStr $Modifiers -KeyName $Key }
 	'click' { Send-Click -ClickButton $Button -Xpos $X -Ypos $Y }
 	'moverelative' { Move-CursorRelative -DeltaX $DX -DeltaY $DY }
